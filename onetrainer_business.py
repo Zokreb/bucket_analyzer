@@ -3,6 +3,7 @@ import re
 import json
 import math
 import shutil
+import sqlite3
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
@@ -54,6 +55,59 @@ class ImageInfo:
     alternate_crop_dim: str = ""
     
     best_ratio_type: str = "primary"
+
+# ==========================================
+# DATABASE CACHE
+# ==========================================
+
+class ImageCacheDB:
+    def __init__(self, db_path="onetrainer_cache.db"):
+        # check_same_thread=False allows us to use it safely inside the QThread
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.create_tables()
+
+    def create_tables(self):
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS image_cache (
+                filepath TEXT PRIMARY KEY,
+                file_size INTEGER,
+                mtime REAL,
+                width INTEGER,
+                height INTEGER,
+                yolo_run INTEGER,
+                yolo_x1 INTEGER,
+                yolo_y1 INTEGER,
+                yolo_x2 INTEGER,
+                yolo_y2 INTEGER
+            )
+        ''')
+        self.conn.commit()
+
+    def get(self, filepath: str, mtime: float, size: int, requires_yolo: bool):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT file_size, mtime, width, height, yolo_run, yolo_x1, yolo_y1, yolo_x2, yolo_y2 FROM image_cache WHERE filepath = ?', (filepath,))
+        row = cursor.fetchone()
+        
+        if row:
+            db_size, db_mtime, w, h, yolo_run, yx1, yy1, yx2, yy2 = row
+            # Verify file hasn't been modified on disk since last cache
+            if db_size == size and abs(db_mtime - mtime) < 1.0:
+                # If the user just turned on YOLO but the cache was built without it, force a rescan
+                if requires_yolo and not yolo_run:
+                    return None 
+                    
+                yolo_box = (yx1, yy1, yx2, yy2) if yx1 is not None else None
+                return w, h, yolo_box
+        return None
+
+    def put(self, filepath: str, size: int, mtime: float, w: int, h: int, yolo_box: Optional[Tuple], yolo_run: int):
+        yx1, yy1, yx2, yy2 = yolo_box if yolo_box else (None, None, None, None)
+        self.conn.execute('''
+            INSERT OR REPLACE INTO image_cache
+            (filepath, file_size, mtime, width, height, yolo_run, yolo_x1, yolo_y1, yolo_x2, yolo_y2)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (filepath, size, mtime, w, h, yolo_run, yx1, yy1, yx2, yy2))
+        self.conn.commit()
 
 # ==========================================
 # PROCESSING LOGIC
@@ -148,18 +202,15 @@ class DatasetExporter:
         base_name = os.path.splitext(img_info.filename)[0]
         base_dir = os.path.dirname(img_info.filepath)
 
-        # 1. Save Main Image strictly as PNG
         img = QImage(img_info.filepath)
         cropped_img = img.copy(QRect(*crop_rect))
         main_out_path = os.path.join(save_dir, f"{base_name}.png")
         cropped_img.save(main_out_path, "PNG")
 
-        # 2. Copy joint caption text file
         txt_path = os.path.join(base_dir, f"{base_name}.txt")
         if os.path.exists(txt_path):
             shutil.copy2(txt_path, os.path.join(save_dir, f"{base_name}.txt"))
 
-        # 3. Handle Masklabel (relative crop calculation)
         possible_exts = ['.png', '.jpg', '.jpeg', '.webp', '.bmp']
         mask_path = None
         for ext in possible_exts:
@@ -173,18 +224,10 @@ class DatasetExporter:
             mw, mh = mask_img.width(), mask_img.height()
             if mw > 0 and mh > 0:
                 cx, cy, cw, ch = crop_rect
-                
-                # Calculate relative boundaries (0.0 to 1.0)
-                rel_x = cx / img_info.width
-                rel_y = cy / img_info.height
-                rel_w = cw / img_info.width
-                rel_h = ch / img_info.height
+                rel_x, rel_y = cx / img_info.width, cy / img_info.height
+                rel_w, rel_h = cw / img_info.width, ch / img_info.height
 
-                # Map back to mask absolute dimensions
-                mx = int(rel_x * mw)
-                my = int(rel_y * mh)
-                
-                # Min clamping ensures we never run off the edge by 1 pixel due to rounding
+                mx, my = int(rel_x * mw), int(rel_y * mh)
                 mcw = min(mw - mx, int(rel_w * mw))
                 mch = min(mh - my, int(rel_h * mh))
 
@@ -203,7 +246,7 @@ class ScannerWorker(QThread):
     finished_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
 
-    def __init__(self, config_path: str, formats: List[str], target_res: int, neg_filters: List[str], use_yolo: bool, yolo_pad: int):
+    def __init__(self, config_path: str, formats: List[str], target_res: int, neg_filters: List[str], use_yolo: bool, yolo_pad: int, force_concepts: List[str] = None):
         super().__init__()
         self.config_path = config_path
         self.formats = [f.strip().lower() for f in formats]
@@ -211,11 +254,14 @@ class ScannerWorker(QThread):
         self.neg_filters = [nf.strip() for nf in neg_filters if nf.strip()]
         self.use_yolo = use_yolo
         self.yolo_pad = yolo_pad
+        self.force_concepts = force_concepts or []
         self.is_running = True
         self.yolo_model = None
 
     def run(self):
         try:
+            db = ImageCacheDB()
+            
             if self.use_yolo and YOLO_AVAILABLE:
                 self.yolo_model = YOLO('yolov8n.pt')
             elif self.use_yolo and not YOLO_AVAILABLE:
@@ -226,33 +272,62 @@ class ScannerWorker(QThread):
                 
             for concept in config.get('concepts', []):
                 if not self.is_running: break
+                
                 name = concept.get('name', 'Unknown')
+                is_enabled = concept.get('enabled', False)
                 path = PathResolver.resolve(concept.get('path', ''))
-                self.concept_started_signal.emit(name, concept.get('enabled', False))
-                if not os.path.exists(path): continue
+                
+                self.concept_started_signal.emit(name, is_enabled)
+                
+                # Immediate Skip if disabled
+                if not is_enabled or not os.path.exists(path): 
+                    continue
                     
+                force_this_concept = name in self.force_concepts
+                
                 files = [os.path.join(path, f) for f in os.listdir(path) if f.split('.')[-1].lower() in self.formats and not any(nf in f for nf in self.neg_filters)]
                 total = len(files)
                 
                 for i, filepath in enumerate(files):
                     if not self.is_running: break
-                    reader = QImageReader(filepath)
-                    w, h = reader.size().width(), reader.size().height()
                     
-                    if w > 0 and h > 0:
-                        yolo_box, yolo_padded = None, None
+                    stat = os.stat(filepath)
+                    mtime, size = stat.st_mtime, stat.st_size
+                    
+                    # 1. Attempt Cache Retrieval
+                    cached_data = None
+                    if not force_this_concept:
+                        cached_data = db.get(filepath, mtime, size, self.use_yolo)
+                    
+                    # 2. Process File
+                    w, h, yolo_box = None, None, None
+                    if cached_data:
+                        w, h, yolo_box = cached_data
+                    else:
+                        reader = QImageReader(filepath)
+                        w, h = reader.size().width(), reader.size().height()
+                        yolo_run = 0
                         
-                        if self.use_yolo and self.yolo_model:
-                            results = self.yolo_model(filepath, classes=[0], verbose=False)
-                            boxes = results[0].boxes.xyxy.cpu().numpy()
-                            if len(boxes) > 0:
-                                bx1, by1 = int(np.min(boxes[:, 0])), int(np.min(boxes[:, 1]))
-                                bx2, by2 = int(np.max(boxes[:, 2])), int(np.max(boxes[:, 3]))
-                                yolo_box = (bx1, by1, bx2, by2)
-                                
-                                px1, py1 = max(0, bx1 - self.yolo_pad), max(0, by1 - self.yolo_pad)
-                                px2, py2 = min(w, bx2 + self.yolo_pad), min(h, by2 + self.yolo_pad)
-                                yolo_padded = (px1, py1, px2, py2)
+                        if w > 0 and h > 0:
+                            if self.use_yolo and self.yolo_model:
+                                yolo_run = 1
+                                results = self.yolo_model(filepath, classes=[0], verbose=False)
+                                boxes = results[0].boxes.xyxy.cpu().numpy()
+                                if len(boxes) > 0:
+                                    bx1, by1 = int(np.min(boxes[:, 0])), int(np.min(boxes[:, 1]))
+                                    bx2, by2 = int(np.max(boxes[:, 2])), int(np.max(boxes[:, 3]))
+                                    yolo_box = (bx1, by1, bx2, by2)
+                            
+                            # Save to Database
+                            db.put(filepath, size, mtime, w, h, yolo_box, yolo_run)
+
+                    # 3. Dynamic Crop Calculations
+                    if w and h and w > 0 and h > 0:
+                        yolo_padded = None
+                        if yolo_box:
+                            px1, py1 = max(0, yolo_box[0] - self.yolo_pad), max(0, yolo_box[1] - self.yolo_pad)
+                            px2, py2 = min(w, yolo_box[2] + self.yolo_pad), min(h, yolo_box[3] + self.yolo_pad)
+                            yolo_padded = (px1, py1, px2, py2)
 
                         img_info = BucketCalculator.calculate(w, h, self.target_res, yolo_padded)
                         img_info.filepath = filepath
@@ -262,6 +337,7 @@ class ScannerWorker(QThread):
                         self.image_found_signal.emit(name, img_info)
                         
                     self.progress_signal.emit(name, i + 1, total)
+                    
             self.finished_signal.emit()
             
         except Exception as e:

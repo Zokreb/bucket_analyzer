@@ -1,11 +1,11 @@
 import sys
 import os
-from typing import Dict, List
+from typing import Dict
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QFormLayout, QLineEdit, QPushButton, QSplitter, QTreeWidget, 
-    QTreeWidgetItem, QFileDialog, QProgressBar, QMessageBox, QCheckBox, QLabel
+    QTreeWidgetItem, QFileDialog, QProgressBar, QMessageBox, QCheckBox
 )
 from PyQt6.QtCore import Qt
 
@@ -14,11 +14,8 @@ matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-# Import Business Logic
-from onetrainer_business import BUCKETS, ImageInfo, BucketCalculator, ScannerWorker, BatchCropWorker, YOLO_AVAILABLE
-# Import the new Preview Module
+from onetrainer_business import BUCKETS, ImageInfo, ScannerWorker, BatchCropWorker, BucketCalculator, YOLO_AVAILABLE
 from onetrainer_preview import AdvancedPreviewDialog
-
 
 class HistogramCanvas(FigureCanvas):
     def __init__(self, parent=None):
@@ -47,7 +44,6 @@ class HistogramCanvas(FigureCanvas):
             
         self.fig.tight_layout()
         self.draw()
-
 
 class MainView(QMainWindow):
     def __init__(self):
@@ -84,7 +80,10 @@ class MainView(QMainWindow):
         self.chk_yolo.setEnabled(YOLO_AVAILABLE)
         self.txt_yolo_pad = QLineEdit("20")
         
-        self.btn_scan = QPushButton("Start Scan")
+        self.btn_scan = QPushButton("Start Scan (Uses Cache)")
+        self.btn_force_rescan = QPushButton("Force Rescan Selected")
+        self.btn_force_rescan.setStyleSheet("background-color: #8f2b2b; color: white; font-weight: bold;")
+        
         self.btn_toggle_sel = QPushButton("Toggle All Concepts") 
         self.btn_refresh = QPushButton("Recalculate All")
         self.btn_batch_crop = QPushButton("Batch Apply Smart Crop")
@@ -98,11 +97,16 @@ class MainView(QMainWindow):
         input_layout.addRow("", self.chk_yolo)
         input_layout.addRow("YOLO Pad (px):", self.txt_yolo_pad)
         
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(self.btn_scan)
-        btn_row.addWidget(self.btn_toggle_sel) 
-        btn_row.addWidget(self.btn_refresh)
-        input_layout.addRow("", btn_row)
+        btn_row_top = QHBoxLayout()
+        btn_row_top.addWidget(self.btn_scan)
+        btn_row_top.addWidget(self.btn_force_rescan)
+        input_layout.addRow("", btn_row_top)
+        
+        btn_row_mid = QHBoxLayout()
+        btn_row_mid.addWidget(self.btn_toggle_sel) 
+        btn_row_mid.addWidget(self.btn_refresh)
+        input_layout.addRow("", btn_row_mid)
+        
         input_layout.addRow("", self.btn_batch_crop)
         
         self.histogram_widget = HistogramCanvas(self)
@@ -118,10 +122,6 @@ class MainView(QMainWindow):
             "Orphan", "Progress"
         ])
         
-        self.lbl_summary = QLabel("Total Images: 0 | Enabled: 0")
-        self.lbl_summary.setStyleSheet("font-weight: bold; color: #444;")
-        main_layout.addWidget(self.lbl_summary)
-
         self.main_splitter.addWidget(self.top_splitter)
         self.main_splitter.addWidget(self.tree)
         self.main_splitter.setSizes([350, 450])
@@ -143,6 +143,7 @@ class AppController:
         self.concept_nodes, self.concept_progress, self.image_data = {}, {}, []
         self.view.btn_browse.clicked.connect(self.browse_file)
         self.view.btn_scan.clicked.connect(self.toggle_scan)
+        self.view.btn_force_rescan.clicked.connect(self.run_force_rescan)
         self.view.btn_toggle_sel.clicked.connect(self.toggle_selection) 
         self.view.btn_refresh.clicked.connect(self.update_analytics)
         self.view.btn_batch_crop.clicked.connect(self.run_batch_crop)
@@ -156,9 +157,24 @@ class AppController:
     def toggle_scan(self):
         if self.worker and self.worker.is_running:
             self.worker.stop()
-            self.view.btn_scan.setText("Start Scan")
+            self.view.btn_scan.setText("Start Scan (Uses Cache)")
+        else:
+            self.start_scan()
+            
+    def run_force_rescan(self):
+        active_concepts = [
+            self.view.tree.topLevelItem(i).text(0)
+            for i in range(self.view.tree.topLevelItemCount())
+            if self.view.tree.topLevelItem(i).checkState(0) == Qt.CheckState.Checked
+        ]
+        
+        if not active_concepts:
+            QMessageBox.warning(self.view, "No Selection", "Please check at least one concept in the tree view to force rescan.")
             return
+            
+        self.start_scan(force_concepts=active_concepts)
 
+    def start_scan(self, force_concepts=None):
         cfg = self.view.txt_config.text()
         if not os.path.exists(cfg): return QMessageBox.warning(self.view, "Error", "Invalid config path.")
 
@@ -174,7 +190,8 @@ class AppController:
         self.worker = ScannerWorker(
             cfg, self.view.txt_formats.text().split(','), res,
             self.view.txt_neg_filters.text().split(','),
-            self.view.chk_yolo.isChecked(), pad
+            self.view.chk_yolo.isChecked(), pad,
+            force_concepts=force_concepts
         )
         self.worker.concept_started_signal.connect(self.on_concept_started)
         self.worker.image_found_signal.connect(self.on_image_found)
@@ -188,6 +205,8 @@ class AppController:
         item.setText(0, name)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(0, Qt.CheckState.Checked if is_enabled else Qt.CheckState.Unchecked)
+        
+        # Disabled concepts skip scanning, but we still add a progress bar for UI consistency
         pbar = QProgressBar()
         pbar.setValue(0)
         self.view.tree.setItemWidget(item, 10, pbar)
@@ -219,7 +238,7 @@ class AppController:
             pbar.setValue(cur)
 
     def on_scan_finished(self):
-        self.view.btn_scan.setText("Start Scan")
+        self.view.btn_scan.setText("Start Scan (Uses Cache)")
         self.worker = None
         self.update_analytics()
 
@@ -244,23 +263,18 @@ class AppController:
     def on_item_double_clicked(self, item: QTreeWidgetItem, col: int):
         if item.parent() is None: return
         
-        # Find the starting index
         start_index = 0
         for i, data in enumerate(self.image_data):
             if data['item'] == item:
                 start_index = i
                 break
                 
-        # Launch preview window with full dataset access
         dlg = AdvancedPreviewDialog(self.image_data, start_index, self.view)
         dlg.exec()
         
-        # When dialog closes, the user may have navigated and modified multiple rows.
-        # So we update the TreeView for ALL rows.
         for data in self.image_data:
             self.update_row_visuals(data['item'], data['img_info'])
         
-        # Re-plot histogram based on any ratio changes
         self.update_analytics()
 
     def update_analytics(self):
@@ -268,25 +282,32 @@ class AppController:
         
         try:
             batch_size = int(self.view.txt_batch_size.text())
+            res = int(self.view.txt_resolutions.text().split(',')[0].strip())
+            pad = int(self.view.txt_yolo_pad.text())
         except ValueError:
             return
             
         bucket_counts = {f"{b[0]}:{b[1]}": 0 for b in BUCKETS}
-        total_count = len(self.image_data)
-        enabled_count = 0
 
         for data in self.image_data:
-            img, concept = data['img_info'], data['concept_item']
+            img, child, concept = data['img_info'], data['item'], data['concept_item']
             
+            # Recalculate dimensions dynamically
+            new_info = BucketCalculator.calculate(img.width, img.height, res, img.yolo_padded)
+            img.primary_bucket, img.alternate_bucket = new_info.primary_bucket, new_info.alternate_bucket
+            img.best_ratio_type = new_info.best_ratio_type
+            img.primary_crop_px, img.primary_crop_dim = new_info.primary_crop_px, new_info.primary_crop_dim
+            img.alternate_crop_px, img.alternate_crop_dim = new_info.alternate_crop_px, new_info.alternate_crop_dim
+            img.primary_smart_rect, img.alternate_smart_rect = new_info.primary_smart_rect, new_info.alternate_smart_rect
+            
+            self.update_row_visuals(child, img)
+
             if concept.checkState(0) == Qt.CheckState.Checked:
-                enabled_count += 1
                 target_bucket = img.primary_bucket if img.best_ratio_type == "primary" else img.alternate_bucket
                 b_str = f"{target_bucket[0]}:{target_bucket[1]}"
                 bucket_counts[b_str] = bucket_counts.get(b_str, 0) + 1
 
         self.view.histogram_widget.update_plot(bucket_counts)
-        self.view.lbl_summary.setText(f"Total Images: {total_count} | Enabled: {enabled_count}")
-
 
         for data in self.image_data:
             img, child, concept = data['img_info'], data['item'], data['concept_item']
@@ -304,16 +325,25 @@ class AppController:
         active_imgs = [d['img_info'] for d in self.image_data if d['concept_item'].checkState(0) == Qt.CheckState.Checked]
         if not active_imgs: return
         self.view.btn_batch_crop.setEnabled(False)
-        self.view.btn_batch_crop.setText("Processing...")
+        self.view.btn_batch_crop.setText(f"Processing... 0 / {len(active_imgs)}") # Show initial count
         
         self.batch_worker = BatchCropWorker(active_imgs)
+        
+        # --- ADD THIS LINE TO CONNECT THE SIGNAL ---
+        self.batch_worker.progress_signal.connect(self.on_batch_progress) 
+        
         self.batch_worker.finished_signal.connect(self.on_batch_finished)
         self.batch_worker.start()
+
+    # --- ADD THIS NEW FUNCTION ---
+    def on_batch_progress(self, current: int, total: int):
+        self.view.btn_batch_crop.setText(f"Processing... {current} / {total}")
 
     def on_batch_finished(self):
         self.view.btn_batch_crop.setEnabled(True)
         self.view.btn_batch_crop.setText("Batch Apply Smart Crop")
         QMessageBox.information(self.view, "Complete", "Batch crop saved successfully.")
+
 
 
 if __name__ == "__main__":
