@@ -140,6 +140,7 @@ class AppController:
     def __init__(self, view: MainView):
         self.view = view
         self.worker = None
+        self.last_config_path = None
         self.concept_nodes, self.concept_progress, self.image_data = {}, {}, []
         self.view.btn_browse.clicked.connect(self.browse_file)
         self.view.btn_scan.clicked.connect(self.toggle_scan)
@@ -159,9 +160,16 @@ class AppController:
             self.worker.stop()
             self.view.btn_scan.setText("Start Scan (Uses Cache)")
         else:
-            self.start_scan()
+            self.start_scan(force_rescan=False)
             
     def run_force_rescan(self):
+        cfg = self.view.txt_config.text()
+        
+        # Prevent force rescanning if they just loaded a new file but haven't scanned it normally yet
+        if getattr(self, 'last_config_path', None) != cfg:
+            QMessageBox.warning(self.view, "New File Detected", "You have loaded a new config file. Please run a standard Scan first.")
+            return
+            
         active_concepts = [
             self.view.tree.topLevelItem(i).text(0)
             for i in range(self.view.tree.topLevelItemCount())
@@ -172,15 +180,24 @@ class AppController:
             QMessageBox.warning(self.view, "No Selection", "Please check at least one concept in the tree view to force rescan.")
             return
             
-        self.start_scan(force_concepts=active_concepts)
+        self.start_scan(force_rescan=True)
 
-    def start_scan(self, force_concepts=None):
+    def start_scan(self, force_rescan=False):
         cfg = self.view.txt_config.text()
         if not os.path.exists(cfg): return QMessageBox.warning(self.view, "Error", "Invalid config path.")
 
         res = int(self.view.txt_resolutions.text().split(',')[0].strip())
         pad = int(self.view.txt_yolo_pad.text())
         
+        # ONLY grab UI states if we are rescanning the exact same file.
+        # This prevents old checkboxes from bleeding into a new JSON file.
+        ui_states = {}
+        if getattr(self, 'last_config_path', None) == cfg:
+            for i in range(self.view.tree.topLevelItemCount()):
+                item = self.view.tree.topLevelItem(i)
+                ui_states[item.text(0)] = (item.checkState(0) == Qt.CheckState.Checked)
+        self.last_config_path = cfg
+
         self.view.tree.clear()
         self.concept_nodes.clear()
         self.concept_progress.clear()
@@ -191,7 +208,8 @@ class AppController:
             cfg, self.view.txt_formats.text().split(','), res,
             self.view.txt_neg_filters.text().split(','),
             self.view.chk_yolo.isChecked(), pad,
-            force_concepts=force_concepts
+            force_rescan=force_rescan,
+            ui_states=ui_states
         )
         self.worker.concept_started_signal.connect(self.on_concept_started)
         self.worker.image_found_signal.connect(self.on_image_found)
@@ -206,7 +224,6 @@ class AppController:
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(0, Qt.CheckState.Checked if is_enabled else Qt.CheckState.Unchecked)
         
-        # Disabled concepts skip scanning, but we still add a progress bar for UI consistency
         pbar = QProgressBar()
         pbar.setValue(0)
         self.view.tree.setItemWidget(item, 10, pbar)
@@ -292,13 +309,21 @@ class AppController:
         for data in self.image_data:
             img, child, concept = data['img_info'], data['item'], data['concept_item']
             
-            # Recalculate dimensions dynamically
-            new_info = BucketCalculator.calculate(img.width, img.height, res, img.yolo_padded)
+            yolo_padded = None
+            if img.yolo_box:
+                px1 = max(0, img.yolo_box[0] - pad)
+                py1 = max(0, img.yolo_box[1] - pad)
+                px2 = min(img.width, img.yolo_box[2] + pad)
+                py2 = min(img.height, img.yolo_box[3] + pad)
+                yolo_padded = (px1, py1, px2, py2)
+            
+            new_info = BucketCalculator.calculate(img.width, img.height, res, img.yolo_box, yolo_padded)
             img.primary_bucket, img.alternate_bucket = new_info.primary_bucket, new_info.alternate_bucket
             img.best_ratio_type = new_info.best_ratio_type
             img.primary_crop_px, img.primary_crop_dim = new_info.primary_crop_px, new_info.primary_crop_dim
             img.alternate_crop_px, img.alternate_crop_dim = new_info.alternate_crop_px, new_info.alternate_crop_dim
             img.primary_smart_rect, img.alternate_smart_rect = new_info.primary_smart_rect, new_info.alternate_smart_rect
+            img.yolo_padded = yolo_padded
             
             self.update_row_visuals(child, img)
 
@@ -325,17 +350,13 @@ class AppController:
         active_imgs = [d['img_info'] for d in self.image_data if d['concept_item'].checkState(0) == Qt.CheckState.Checked]
         if not active_imgs: return
         self.view.btn_batch_crop.setEnabled(False)
-        self.view.btn_batch_crop.setText(f"Processing... 0 / {len(active_imgs)}") # Show initial count
+        self.view.btn_batch_crop.setText(f"Processing... 0 / {len(active_imgs)}")
         
         self.batch_worker = BatchCropWorker(active_imgs)
-        
-        # --- ADD THIS LINE TO CONNECT THE SIGNAL ---
-        self.batch_worker.progress_signal.connect(self.on_batch_progress) 
-        
+        self.batch_worker.progress_signal.connect(self.on_batch_progress)
         self.batch_worker.finished_signal.connect(self.on_batch_finished)
         self.batch_worker.start()
 
-    # --- ADD THIS NEW FUNCTION ---
     def on_batch_progress(self, current: int, total: int):
         self.view.btn_batch_crop.setText(f"Processing... {current} / {total}")
 
@@ -343,7 +364,6 @@ class AppController:
         self.view.btn_batch_crop.setEnabled(True)
         self.view.btn_batch_crop.setText("Batch Apply Smart Crop")
         QMessageBox.information(self.view, "Complete", "Batch crop saved successfully.")
-
 
 
 if __name__ == "__main__":

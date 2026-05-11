@@ -62,7 +62,6 @@ class ImageInfo:
 
 class ImageCacheDB:
     def __init__(self, db_path="onetrainer_cache.db"):
-        # check_same_thread=False allows us to use it safely inside the QThread
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.create_tables()
 
@@ -90,12 +89,9 @@ class ImageCacheDB:
         
         if row:
             db_size, db_mtime, w, h, yolo_run, yx1, yy1, yx2, yy2 = row
-            # Verify file hasn't been modified on disk since last cache
             if db_size == size and abs(db_mtime - mtime) < 1.0:
-                # If the user just turned on YOLO but the cache was built without it, force a rescan
                 if requires_yolo and not yolo_run:
                     return None 
-                    
                 yolo_box = (yx1, yy1, yx2, yy2) if yx1 is not None else None
                 return w, h, yolo_box
         return None
@@ -167,7 +163,7 @@ class CropMath:
 
 class BucketCalculator:
     @staticmethod
-    def calculate(w: int, h: int, resolution: int, yolo_padded: Optional[Tuple[int, int, int, int]] = None) -> ImageInfo:
+    def calculate(w: int, h: int, resolution: int, yolo_box: Optional[Tuple[int, int, int, int]] = None, yolo_padded: Optional[Tuple[int, int, int, int]] = None) -> ImageInfo:
         ar = w / h
         sorted_buckets = sorted(BUCKETS, key=lambda b: abs((b[0]/b[1]) - ar))
         primary, alternate = sorted_buckets[0], sorted_buckets[1]
@@ -176,16 +172,24 @@ class BucketCalculator:
         primary_smart = CropMath.calculate_smart_crop(w, h, primary, yolo_padded)
         alternate_smart = CropMath.calculate_smart_crop(w, h, alternate, yolo_padded)
         
-        primary_cutoff = CropMath.calculate_cutoff(primary_smart, yolo_padded) if yolo_padded else 0.0
-        alternate_cutoff = CropMath.calculate_cutoff(alternate_smart, yolo_padded) if yolo_padded else 0.0
-        best_ratio = "primary" if primary_cutoff <= alternate_cutoff else "alternate"
+        primary_cutoff = CropMath.calculate_cutoff(primary_smart, yolo_box) if yolo_box else 0.0
+        alternate_cutoff = CropMath.calculate_cutoff(alternate_smart, yolo_box) if yolo_box else 0.0
+        
+        if primary_cutoff == 0:
+            best_ratio = "primary"
+        elif alternate_cutoff == 0:
+            best_ratio = "alternate"
+        elif alternate_cutoff < primary_cutoff:
+            best_ratio = "alternate"
+        else:
+            best_ratio = "primary"
 
         pri_px, pri_dim = CropMath.get_band_metrics(w, h, primary, resolution)
         alt_px, alt_dim = CropMath.get_band_metrics(w, h, alternate, resolution)
             
         return ImageInfo(
             filepath="", filename="", width=w, height=h, mp=(w*h)/1000000,
-            yolo_box=None, yolo_padded=yolo_padded,
+            yolo_box=yolo_box, yolo_padded=yolo_padded,
             primary_bucket=primary, alternate_bucket=alternate,
             center_crop_rect=center_crop, primary_smart_rect=primary_smart,
             alternate_smart_rect=alternate_smart,
@@ -246,7 +250,7 @@ class ScannerWorker(QThread):
     finished_signal = pyqtSignal()
     error_signal = pyqtSignal(str)
 
-    def __init__(self, config_path: str, formats: List[str], target_res: int, neg_filters: List[str], use_yolo: bool, yolo_pad: int, force_concepts: List[str] = None):
+    def __init__(self, config_path: str, formats: List[str], target_res: int, neg_filters: List[str], use_yolo: bool, yolo_pad: int, force_rescan: bool = False, ui_states: dict = None):
         super().__init__()
         self.config_path = config_path
         self.formats = [f.strip().lower() for f in formats]
@@ -254,7 +258,8 @@ class ScannerWorker(QThread):
         self.neg_filters = [nf.strip() for nf in neg_filters if nf.strip()]
         self.use_yolo = use_yolo
         self.yolo_pad = yolo_pad
-        self.force_concepts = force_concepts or []
+        self.force_rescan = force_rescan
+        self.ui_states = ui_states or {}
         self.is_running = True
         self.yolo_model = None
 
@@ -268,23 +273,30 @@ class ScannerWorker(QThread):
                 self.error_signal.emit("YOLO enabled but 'ultralytics' not installed.")
                 return
 
-            with open(self.config_path, 'r', encoding='utf-8') as f: config = json.load(f)
+            with open(self.config_path, 'r', encoding='utf-8') as f: 
+                config = json.load(f)
                 
             for concept in config.get('concepts', []):
                 if not self.is_running: break
                 
-                name = concept.get('name', 'Unknown')
-                is_enabled = concept.get('enabled', False)
+                # Smart fallback for blank OneTrainer names
+                raw_name = concept.get('name', '')
                 path = PathResolver.resolve(concept.get('path', ''))
+                name = str(raw_name).strip() if raw_name else ""
+                if not name:
+                    name = os.path.basename(os.path.normpath(path)) if path else "Unknown"
+                
+                # UI Selection overwrites JSON defaults
+                if self.ui_states and name in self.ui_states:
+                    is_enabled = self.ui_states[name]
+                else:
+                    is_enabled = concept.get('enabled', False)
                 
                 self.concept_started_signal.emit(name, is_enabled)
                 
-                # Immediate Skip if disabled
                 if not is_enabled or not os.path.exists(path): 
                     continue
                     
-                force_this_concept = name in self.force_concepts
-                
                 files = [os.path.join(path, f) for f in os.listdir(path) if f.split('.')[-1].lower() in self.formats and not any(nf in f for nf in self.neg_filters)]
                 total = len(files)
                 
@@ -294,12 +306,10 @@ class ScannerWorker(QThread):
                     stat = os.stat(filepath)
                     mtime, size = stat.st_mtime, stat.st_size
                     
-                    # 1. Attempt Cache Retrieval
                     cached_data = None
-                    if not force_this_concept:
+                    if not self.force_rescan:
                         cached_data = db.get(filepath, mtime, size, self.use_yolo)
                     
-                    # 2. Process File
                     w, h, yolo_box = None, None, None
                     if cached_data:
                         w, h, yolo_box = cached_data
@@ -318,10 +328,8 @@ class ScannerWorker(QThread):
                                     bx2, by2 = int(np.max(boxes[:, 2])), int(np.max(boxes[:, 3]))
                                     yolo_box = (bx1, by1, bx2, by2)
                             
-                            # Save to Database
                             db.put(filepath, size, mtime, w, h, yolo_box, yolo_run)
 
-                    # 3. Dynamic Crop Calculations
                     if w and h and w > 0 and h > 0:
                         yolo_padded = None
                         if yolo_box:
@@ -329,10 +337,9 @@ class ScannerWorker(QThread):
                             px2, py2 = min(w, yolo_box[2] + self.yolo_pad), min(h, yolo_box[3] + self.yolo_pad)
                             yolo_padded = (px1, py1, px2, py2)
 
-                        img_info = BucketCalculator.calculate(w, h, self.target_res, yolo_padded)
+                        img_info = BucketCalculator.calculate(w, h, self.target_res, yolo_box, yolo_padded)
                         img_info.filepath = filepath
                         img_info.filename = os.path.basename(filepath)
-                        img_info.yolo_box = yolo_box
                         
                         self.image_found_signal.emit(name, img_info)
                         
